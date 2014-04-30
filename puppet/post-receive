@@ -1,0 +1,72 @@
+#!/bin/sh
+#
+# post-receive hook that
+# - creates dynamic environments via puppet-sync
+# - calls jenkins jobs on a push to master/testing/production
+#
+
+. $(dirname $0)/functions
+
+REPO="ssh://<insert your repo here>/puppet.git"
+DEPLOY="/etc/puppet/environments"
+SSH_ARGS="-i $HOME/.ssh/id_rsa"
+PUPPETMASTER="puppet@<insert puppet host here>"
+SYNC_COMMAND="~/bin/puppet-sync"
+JENKINS_HOST="<insert your jenkins host here>"
+
+deploy_tag()
+{
+  tag=$1
+
+  case "$tag" in
+    test_*)
+      echo 'starting deployment in test environment'
+      /usr/bin/curl "http://$JENKINS_HOST/job/puppet_testing_rspec_lint/buildWithParameters?token=testing&GITTAG=$tag"
+      ;;
+    prod_*)
+      echo 'starting deployment in production environment'
+      /usr/bin/curl "http://$JENKINS_HOST/job/puppet_production_rspec_lint/buildWithParameters?token=production&GITTAG=$tag"
+      ;;
+    *)
+      echo 'Not a tag that starts with test_ or prod_, will do nothing'
+      ;;
+  esac
+}
+
+while read oldrev newrev refname
+do
+  BRANCH=`echo $refname | sed -n 's/^refs\/heads\///p'`
+  [ "$newrev" -eq 0 ] 2> /dev/null && DELETE='--delete' || DELETE=''
+
+  set_change_type
+  set_rev_types
+  set_describe_tags
+
+  ssh $SSH_ARGS "$PUPPETMASTER" "$SYNC_COMMAND" \
+    --branch "$BRANCH" \
+    --repository "$REPO" \
+    --deploy "$DEPLOY" \
+    $DELETE
+
+  echo "BRANCH: $BRANCH, refname: $refname, rev_type: $rev_type"
+
+  case "$refname","$rev_type" in
+    refs/tags/*,tag)
+      short_refname=${refname##refs/tags/}
+      echo "created an annotated tag $short_refname"
+      deploy_tag $short_refname
+      ;;
+    refs/heads/*,commit)
+      short_refname=${refname##refs/heads/}
+      echo "pushed to branch $short_refname"
+      [ "$short_refname" == "master" ]     && /usr/bin/curl 'http://$JENKINS_HOST/job/puppet_development_rspec_lint/build?token=develop'
+      [ "$short_refname" == "testing" ]    && /usr/bin/curl 'http://$JENKINS_HOST/job/puppet_testing_rspec_lint_nodeploy/buildWithParameters?token=testing'
+      [ "$short_refname" == "production" ] && /usr/bin/curl 'http://$JENKINS_HOST/job/puppet_production_rspec_lint_nodeploy/buildWithParameters?token=production'
+      ;;
+    refs/remotes/*,commit)
+      short_refname=${refname##refs/heads/}
+      echo "pushed to remote tracking branch $short_refname"
+      ;;
+  esac
+
+done
